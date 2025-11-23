@@ -141,55 +141,136 @@ pub fn main() !void {
         return;
     }
 
-    try writer.print("\nFound {d} git repositories:\n\n", .{repos.items.len});
+    const stderr = std.fs.File.stderr();
+    {
+        var buf: [256]u8 = undefined;
+        const msg = try std.fmt.bufPrint(&buf, "\nFound {d} git repositories, checking status...\n", .{repos.items.len});
+        _ = try stderr.write(msg);
+    }
 
-    // Check status of each repository
+    // Structure to hold results
+    const RepoResult = struct {
+        repo_path: []const u8,
+        status: git.RepoStatus,
+        is_clean: bool,
+    };
+
+    // Thread-safe result collector
+    var results: std.ArrayList(RepoResult) = .empty;
+    defer {
+        for (results.items) |result| {
+            result.status.deinit(allocator);
+        }
+        results.deinit(allocator);
+    }
+    var results_mutex = std.Thread.Mutex{};
+
+    // Create thread pool for git status checks
+    var pool: std.Thread.Pool = undefined;
+    try pool.init(.{ .allocator = allocator });
+    defer pool.deinit();
+
+    // Counter for progress
+    var checked_count: usize = 0;
+    var checked_mutex = std.Thread.Mutex{};
+
+    // Worker function for checking repo status
+    const StatusWorker = struct {
+        fn check(
+            alloc: std.mem.Allocator,
+            repo_path: []const u8,
+            res: *std.ArrayList(RepoResult),
+            mutex: *std.Thread.Mutex,
+            count: *usize,
+            count_mutex: *std.Thread.Mutex,
+            total: usize,
+        ) void {
+            const status = git.getRepoStatus(alloc, repo_path) catch return;
+
+            const is_clean = status.untracked_files.len == 0 and
+                status.modified_files.len == 0 and
+                status.unpushed_commits == 0;
+
+            mutex.lock();
+            defer mutex.unlock();
+
+            res.append(alloc, .{
+                .repo_path = repo_path,
+                .status = status,
+                .is_clean = is_clean,
+            }) catch {
+                status.deinit(alloc);
+            };
+
+            // Update progress
+            count_mutex.lock();
+            count.* += 1;
+            const current = count.*;
+            count_mutex.unlock();
+
+            // Print progress for large scans
+            if (total > 20 and current % 10 == 0) {
+                const progress_stderr = std.fs.File.stderr();
+                var buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "\rChecked {d}/{d} repositories...", .{ current, total }) catch return;
+                _ = progress_stderr.write(msg) catch {};
+            }
+        }
+    };
+
+    // Spawn parallel status checks
+    var wg = std.Thread.WaitGroup{};
+    for (repos.items) |repo| {
+        pool.spawnWg(&wg, StatusWorker.check, .{ allocator, repo.path, &results, &results_mutex, &checked_count, &checked_mutex, repos.items.len });
+    }
+    pool.waitAndWork(&wg);
+
+    // Clear progress line if we printed it
+    if (repos.items.len > 20) {
+        _ = try stderr.write("\r                                                  \r");
+    }
+    try writer.print("\n", .{});
+
+    // Display results
     var clean_count: usize = 0;
     var dirty_count: usize = 0;
     var has_errors = false;
 
-    for (repos.items) |repo| {
-        const status = try git.getRepoStatus(allocator, repo.path);
-        defer status.deinit(allocator);
-
-        const is_clean = status.untracked_files.len == 0 and
-            status.modified_files.len == 0 and
-            status.unpushed_commits == 0;
-
-        if (is_clean) {
+    for (results.items) |result| {
+        if (result.is_clean) {
             clean_count += 1;
             if (show_all) {
-                try writer.print("{s}✓ {s}{s}\n", .{ Color.green.code(), repo.path, Color.reset.code() });
+                try writer.print("{s}✓ {s}{s}\n", .{ Color.green.code(), result.repo_path, Color.reset.code() });
                 try writer.print("  Clean\n\n", .{});
             }
         } else {
             dirty_count += 1;
             has_errors = true;
 
-            try writer.print("{s}⚠ {s}{s}\n", .{ Color.yellow.code(), repo.path, Color.reset.code() });
+            try writer.print("{s}⚠ {s}{s}\n", .{ Color.yellow.code(), result.repo_path, Color.reset.code() });
 
-            if (status.untracked_files.len > 0) {
-                try writer.print("  Untracked files: {d}\n", .{status.untracked_files.len});
-                for (status.untracked_files[0..@min(3, status.untracked_files.len)]) |file| {
+            if (result.status.untracked_files.len > 0) {
+                try writer.print("  Untracked files: {d}\n", .{result.status.untracked_files.len});
+                for (result.status.untracked_files[0..@min(3, result.status.untracked_files.len)]) |file| {
                     try writer.print("    - {s}\n", .{file});
                 }
-                if (status.untracked_files.len > 3) {
-                    try writer.print("    ... and {d} more\n", .{status.untracked_files.len - 3});
+                if (result.status.untracked_files.len > 3) {
+                    try writer.print("    ... and {d} more\n", .{result.status.untracked_files.len - 3});
                 }
             }
 
-            if (status.modified_files.len > 0) {
-                try writer.print("{s}  Modified files: {d}{s}\n", .{ Color.red.code(), status.modified_files.len, Color.reset.code() });
-                for (status.modified_files[0..@min(3, status.modified_files.len)]) |file| {
+            if (result.status.modified_files.len > 0) {
+                try writer.print("{s}  Modified files: {d}{s}\n", .{ Color.red.code(), result.status.modified_files.len, Color.reset.code() });
+                for (result.status.modified_files[0..@min(3, result.status.modified_files.len)]) |file| {
                     try writer.print("{s}    - {s}{s}\n", .{ Color.red.code(), file, Color.reset.code() });
                 }
-                if (status.modified_files.len > 3) {
-                    try writer.print("    ... and {d} more\n", .{status.modified_files.len - 3});
+                if (result.status.modified_files.len > 3) {
+                    try writer.print("    ... and {d} more\n", .{result.status.modified_files.len - 3});
                 }
             }
 
-            if (status.unpushed_commits > 0) {
-                try writer.print("{s}  Unpushed commits: {d}{s}\n", .{ Color.yellow.code(), status.unpushed_commits, Color.reset.code() });
+            if (result.status.unpushed_commits > 0) {
+                try writer.print("{s}  Unpushed commits: {d}{s}\n", .{ Color.yellow.code(), result.status.unpushed_commits, Color.reset.code() });
             }
 
             try writer.print("\n", .{});
