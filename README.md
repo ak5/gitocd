@@ -2,6 +2,8 @@
 
 A blazing-fast CLI tool written in Zig that recursively scans your filesystem to find git repositories that need attention.
 
+> ⚠️ **Disclaimer**: This project was vibecoded as a learning exercise for Zig and parallel programming. While it works, the code was written quickly and may contain bugs or non-idiomatic patterns. Use at your own peril! Contributions and improvements welcome.
+
 ## What It Does
 
 `gitocd` scans directories (starting from the current working directory by default) and reports on git repositories that aren't clean:
